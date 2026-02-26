@@ -1,5 +1,3 @@
-
-```markdown
 # 🏇 Betfair Agent
 
 A sophisticated, autonomous betting agent for Australian horse and greyhound racing, powered by **Gemini 2.5 Flash**, **Flumine**, and the **Betfair API**.
@@ -45,7 +43,7 @@ This agent doesn't just place bets — it acts as a full **trading desk**. It or
 
 ### 2. Install Dependencies
 
-```bash
+
 pip install -r requirements.txt
 ```
 
