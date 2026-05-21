@@ -1,17 +1,13 @@
-# 🏇 Betfair Lay Agent Dependencies
+# Betfair MCP Server Dependencies
 
 # --- Betfair API & Streaming ---
-# Core API wrapper for interaction
+# Core API wrapper
 betfairlightweight>=2.12.0
 # Streaming engine for automation and millisecond-latency updates
 flumine>=1.36.0
 
-# --- AI & LLM ---
-# Google Gemini 2.5 Flash SDK
-google-generativeai>=0.8.3
-
-# --- Integration ---
-# Model Context Protocol (Required for Claude Desktop integration)
+# --- MCP transport ---
+# Model Context Protocol — used by Codex CLI, Claude Desktop, and any MCP client
 mcp>=1.2.0
 
 # --- Data Science & Utilities ---

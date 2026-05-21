@@ -43,6 +43,32 @@ def _get_betting_memory():
     from betting_memory import get_betting_memory
     return get_betting_memory()
 
+def _get_prediction_ledger():
+    from prediction_ledger import get_prediction_ledger
+    return get_prediction_ledger()
+
+_movement_baselines: dict[str, float] = {}
+_movement_lock = threading.Lock()
+
+
+def _market_movement_signal(market_id: str, selection_id: str, current_vwap: Optional[float]) -> dict:
+    """Compare current runner VWAP to the first observed baseline in this process."""
+    if current_vwap is None:
+        return {"signal": "UNKNOWN", "delta_ticks": 0}
+
+    key = f"{market_id}:{selection_id}"
+    with _movement_lock:
+        baseline = _movement_baselines.get(key)
+        if baseline is None:
+            _movement_baselines[key] = float(current_vwap)
+            baseline = float(current_vwap)
+
+    try:
+        from market_analyser import market_support_signal
+        return market_support_signal(baseline, float(current_vwap))
+    except Exception:
+        return {"signal": "UNKNOWN", "delta_ticks": 0}
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # SHARED SESSION STATE  (thread-safe)
@@ -101,10 +127,12 @@ class SubAgentBase:
     """
     name: str = "SubAgent"
 
-    def __init__(self, betfair_client, ratings_cache, state: SessionState):
+    def __init__(self, betfair_client, ratings_cache, state: SessionState, score_config=None):
+        from opportunity_scoring import ScoreConfig
         self.bf     = betfair_client
         self.rc     = ratings_cache
         self.state  = state
+        self.score_config = score_config or ScoreConfig()
 
     def run(self, task: str) -> dict:
         """Override in subclasses. Returns {"success": bool, ...}"""
@@ -165,10 +193,12 @@ class VenueAnalystAgent(SubAgentBase):
             pass
 
         # 1. Get venue markets from ratings
-        markets = self.rc.get_venue_markets(venue, model="kash")
+        model_name = "kash"
+        markets = self.rc.get_venue_markets(venue, model=model_name)
         if not markets:
             self._log(f"No Kash ratings found for {venue} — trying Iggy (greyhounds)")
-            markets = self.rc.get_venue_markets(venue, model="iggy")
+            model_name = "iggy"
+            markets = self.rc.get_venue_markets(venue, model=model_name)
 
         if not markets:
             return {
@@ -182,6 +212,8 @@ class VenueAnalystAgent(SubAgentBase):
         self.state.races_analysed = len(markets)
 
         scored = []
+        candidate_records = []
+        hist_venue_roi = venue_roi.get(venue, 0)
         for market in markets:
             mid = market["market_id"]
 
@@ -199,6 +231,18 @@ class VenueAnalystAgent(SubAgentBase):
                     meta = {}
                     meta_map = {}
 
+                # ── BSP/SP edge predictions (cached, TTL=60s) ──────────────
+                sp_map = {}
+                try:
+                    sp_result = cache.bsp_predictions(mid, fetch_fn=lambda m=mid: self.bf.get_sp_predictions(m))
+                    if sp_result.get("success"):
+                        sp_map = {
+                            str(r.get("selection_id")): r
+                            for r in sp_result.get("runners", [])
+                        }
+                except Exception:
+                    sp_map = {}
+
                 for runner in book.get("runners", []):
                     if runner.get("status") != "ACTIVE":
                         continue
@@ -211,10 +255,11 @@ class VenueAnalystAgent(SubAgentBase):
                     profit_ratio = round(1.0 / (best_lay - 1.0), 3) if best_lay > 1 else 0
 
                     # Model edge
-                    edge = self.rc.model_edge(mid, sel_id, best_lay, best_back, model="kash")
+                    edge = self.rc.model_edge(mid, sel_id, best_lay, best_back, model=model_name)
 
                     # WOM from market_analyser
                     wom_signal = "UNKNOWN"
+                    wom_data = {}
                     try:
                         from market_analyser import weight_of_money
                         wom_data   = weight_of_money(
@@ -224,6 +269,36 @@ class VenueAnalystAgent(SubAgentBase):
                         wom_signal = wom_data.get("signal", "UNKNOWN")
                     except Exception:
                         pass
+
+                    # Spread/liquidity
+                    spread = {}
+                    try:
+                        from market_analyser import market_spread
+                        spread = market_spread(best_back, best_lay)
+                    except Exception:
+                        pass
+
+                    movement_signal = {"signal": "UNKNOWN", "delta_ticks": 0}
+                    try:
+                        from market_analyser import vwap
+                        current_vwap = vwap(runner.get("back_prices", []), depth=3) or best_back
+                        movement_signal = _market_movement_signal(mid, sel_id, current_vwap)
+                    except Exception:
+                        pass
+
+                    # BSP value signal
+                    sp_data = sp_map.get(sel_id, {})
+                    sp_edge = sp_data.get("edge_analysis") or {}
+                    if not sp_edge:
+                        try:
+                            from staking_engine import estimate_edge_from_sp
+                            sp_edge = estimate_edge_from_sp(
+                                float(best_lay),
+                                sp_data.get("sp_near"),
+                                sp_data.get("sp_far"),
+                            )
+                        except Exception:
+                            sp_edge = {}
 
                     # Race context score
                     runner_meta = meta_map.get(sel_id, {})
@@ -242,35 +317,29 @@ class VenueAnalystAgent(SubAgentBase):
                     except Exception:
                         pass
 
-                    # ── Composite opportunity score ────────────────────────
-                    # Base scoring (same as before)
-                    opp_score = 0
-                    if profit_ratio >= 1.5:
-                        opp_score += 40
-                    if edge.get("signal") in ("LAY", "BOTH"):
-                        opp_score += 25
-                    if wom_signal == "LAY_HEAVY":
-                        opp_score += 20
-                    elif wom_signal == "BACK_HEAVY":
-                        opp_score -= 15
-                    opp_score += context_score
-
-                    # ── Historical performance adjustment (learning) ───────
-                    # Boost/penalise based on what has actually worked at this venue
-                    hist_venue_roi = venue_roi.get(venue, 0)
-                    if hist_venue_roi > 10:       # historically profitable venue
-                        opp_score += 10
-                    elif hist_venue_roi < -10:     # historically lossy venue
-                        opp_score -= 10
-
-                    # WOM signal accuracy adjustment from historical data
+                    # Historical performance adjustment from what has worked.
                     hist_wom_roi = wom_roi.get(wom_signal, 0)
-                    if hist_wom_roi > 10:
-                        opp_score += 8
-                    elif hist_wom_roi < -10:
-                        opp_score -= 8
 
-                    scored.append({
+                    from opportunity_scoring import score_lay_opportunity
+                    score_payload = score_lay_opportunity(
+                        lay_price=best_lay,
+                        best_back=best_back,
+                        model_edge=edge,
+                        wom_signal=wom_signal,
+                        context_score=context_score,
+                        sp_edge=sp_edge,
+                        movement_signal=movement_signal,
+                        spread=spread,
+                        historical_adjustments={
+                            "venue_roi": hist_venue_roi,
+                            "wom_roi": hist_wom_roi,
+                        },
+                        config=self.score_config,
+                    )
+
+                    candidate_id = f"{self.state.started_at.isoformat()}:{mid}:{sel_id}"
+                    opp = {
+                        "candidate_id":   candidate_id,
                         "market_id":      mid,
                         "race_number":    market.get("race_number", ""),
                         "selection_id":   runner["selection_id"],
@@ -279,7 +348,13 @@ class VenueAnalystAgent(SubAgentBase):
                         "best_back":      best_back,
                         "profit_ratio":   profit_ratio,
                         "model_edge":     edge,
+                        "sp_edge":        sp_edge,
+                        "sp_near":        sp_data.get("sp_near"),
+                        "sp_far":         sp_data.get("sp_far") or sp_edge.get("sp_far"),
                         "wom_signal":     wom_signal,
+                        "wom":            wom_data,
+                        "spread":         spread,
+                        "movement_signal": movement_signal,
                         "jockey":         runner_meta.get("jockey", ""),
                         "barrier":        runner_meta.get("barrier", ""),
                         "barrier_group":  runner_meta.get("barrier_group", ""),
@@ -287,19 +362,60 @@ class VenueAnalystAgent(SubAgentBase):
                         "track_condition": meta.get("track_condition", ""),
                         "context_score":  context_score,
                         "context_verdict": context_verdict,
-                        "opportunity_score": opp_score,
+                        "opportunity_score": score_payload["score"],
+                        "score_components": score_payload["components"],
+                        "score_issues":   score_payload["issues"],
+                        "estimated_win_prob": score_payload["estimated_win_prob"],
+                        "estimated_win_prob_source": score_payload["estimated_win_prob_source"],
                         "hist_venue_roi": hist_venue_roi,
                         "hist_wom_roi":   hist_wom_roi,
-                        "verdict": (
-                            "STRONG_LAY" if opp_score >= 60 else
-                            "LAY"        if opp_score >= 35 else
-                            "MARGINAL"   if opp_score >= 15 else
-                            "SKIP"
-                        ),
-                    })
+                        "verdict":        score_payload["verdict"],
+                    }
+                    scored.append(opp)
+
+                    try:
+                        from prediction_ledger import CandidateRecord
+                        candidate_records.append(CandidateRecord(
+                            candidate_id=candidate_id,
+                            market_id=mid,
+                            selection_id=int(runner["selection_id"]),
+                            runner_name=runner.get("runner_name", "Unknown"),
+                            venue=venue,
+                            race_number=str(market.get("race_number", "")),
+                            decision=(
+                                "SELECTED"
+                                if score_payload["verdict"] in ("STRONG_LAY", "LAY")
+                                else "SKIPPED"
+                            ),
+                            verdict=score_payload["verdict"],
+                            score=score_payload["score"],
+                            lay_price=float(best_lay),
+                            best_back=best_back,
+                            estimated_win_prob=score_payload["estimated_win_prob"],
+                            estimated_win_prob_source=score_payload["estimated_win_prob_source"],
+                            profit_ratio=score_payload["profit_ratio"],
+                            wom_signal=wom_signal,
+                            model_signal=edge.get("signal", "UNKNOWN"),
+                            model_edge_pct=edge.get("edge_pct") or 0.0,
+                            sp_near=sp_data.get("sp_near"),
+                            sp_far=sp_data.get("sp_far") or sp_edge.get("reference_sp"),
+                            edge_net=sp_edge.get("edge_net"),
+                            context_score=context_score,
+                            movement_signal=movement_signal.get("signal", "UNKNOWN"),
+                            issues=score_payload["issues"],
+                            components=score_payload["components"],
+                        ))
+                    except Exception as e:
+                        self._log(f"Could not build prediction candidate record (non-fatal): {e}")
             except Exception as e:
                 self._log(f"Error analysing {mid}: {e}")
                 continue
+
+        if candidate_records:
+            try:
+                _get_prediction_ledger().record_candidates(candidate_records)
+            except Exception as e:
+                self._log(f"Could not record prediction candidates (non-fatal): {e}")
 
         # Sort best opportunities first
         scored.sort(key=lambda x: x["opportunity_score"], reverse=True)
@@ -382,9 +498,15 @@ class RiskManagerAgent(SubAgentBase):
                 break
 
             market_id   = opp["market_id"]
+            selection_id = int(opp["selection_id"])
+            allocation_key = f"{market_id}:{selection_id}"
             best_lay    = opp.get("best_lay", 2.0)
             model_price = opp.get("model_edge", {}).get("model_price") or best_lay
-            win_prob    = min(0.95, 1.0 / model_price)
+            win_prob    = opp.get("estimated_win_prob")
+            if win_prob is None:
+                win_prob = min(0.95, 1.0 / model_price)
+            else:
+                win_prob = float(win_prob)
 
             # Kelly sizing
             try:
@@ -425,13 +547,17 @@ class RiskManagerAgent(SubAgentBase):
             if raw_stake < 2.0:
                 continue
 
-            allocations[market_id] = {
+            allocations[allocation_key] = {
+                "market_id":     market_id,
+                "selection_id":  selection_id,
+                "runner_name":   opp.get("runner_name"),
                 "backer_stake":  round(raw_stake, 2),
                 "liability":     round(liability, 2),
                 "max_liability": round(max_per_race, 2),
                 "win_prob":      round(win_prob, 4),
                 "price_bucket":  bucket,
                 "hist_bucket_roi": hist_roi,
+                "opportunity_score": opp.get("opportunity_score", 0),
             }
             total_committed += liability
 
@@ -515,6 +641,8 @@ class ExecutionAgent(SubAgentBase):
                 venue=venue,
                 betfair_client=self.bf,
                 max_liability=max_liab,
+                min_profit_ratio=self.score_config.min_profit_ratio,
+                min_edge_pct=self.score_config.min_edge_pct,
             )
             # Start in background thread so orchestrator can continue
             thread = runner.start_background()
@@ -546,13 +674,20 @@ class ExecutionAgent(SubAgentBase):
         """Place bets immediately via BetfairClient for each allocated opportunity."""
         placed   = []
         skipped  = []
-        opps_by_market = {o["market_id"]: o for o in self.state.opportunities
-                          if o["verdict"] in ("STRONG_LAY", "LAY")}
+        opps_by_key = {
+            f"{o['market_id']}:{int(o['selection_id'])}": o
+            for o in self.state.opportunities
+            if o["verdict"] in ("STRONG_LAY", "LAY")
+        }
 
-        for market_id, alloc in self.state.allocations.items():
-            opp = opps_by_market.get(market_id)
+        for allocation_key, alloc in self.state.allocations.items():
+            market_id = alloc.get("market_id") or str(allocation_key).split(":")[0]
+            selection_id = alloc.get("selection_id")
+            opp = opps_by_key.get(allocation_key)
+            if opp is None and selection_id is not None:
+                opp = opps_by_key.get(f"{market_id}:{int(selection_id)}")
             if not opp:
-                skipped.append({"market_id": market_id, "reason": "No opportunity found"})
+                skipped.append({"allocation_key": allocation_key, "market_id": market_id, "reason": "No opportunity found"})
                 continue
 
             # Re-check live price before placing
@@ -580,14 +715,45 @@ class ExecutionAgent(SubAgentBase):
                     skipped.append({"market_id": market_id, "reason": f"Lay price {live_lay} no longer meets 1.5x threshold"})
                     continue
 
+                model_edge = opp.get("model_edge") or {}
+                sp_edge = opp.get("sp_edge") or {}
+                context = {
+                    "venue": self.state.venue,
+                    "race_name": opp.get("race_name", ""),
+                    "runner_name": opp.get("runner_name", "Unknown"),
+                    "wom_signal": opp.get("wom_signal", "UNKNOWN"),
+                    "model_signal": model_edge.get("signal", "UNKNOWN"),
+                    "model_edge_pct": model_edge.get("edge_pct") or 0.0,
+                    "timing_window": opp.get("timing_window", "UNKNOWN"),
+                    "profit_ratio": round(1.0 / (live_lay - 1.0), 3) if live_lay > 1.0 else 0.0,
+                    "sp_far": opp.get("sp_far") or sp_edge.get("reference_sp"),
+                    "edge_vs_sp": sp_edge.get("edge_raw") or sp_edge.get("edge_net"),
+                    "opportunity_score": opp.get("opportunity_score", 0),
+                    "estimated_win_prob_source": opp.get("estimated_win_prob_source", "UNKNOWN"),
+                    "score_components": opp.get("score_components", {}),
+                    "candidate_id": opp.get("candidate_id", ""),
+                }
+
                 result = self.bf.place_lay_bet(
                     market_id=market_id,
                     selection_id=int(opp["selection_id"]),
                     lay_price=live_lay,
                     stake=alloc["backer_stake"],
                     strategy_ref="sub_agent",
+                    context=context,
                 )
                 if result.get("success"):
+                    try:
+                        candidate_id = opp.get("candidate_id")
+                        if candidate_id and result.get("bet_id"):
+                            _get_prediction_ledger().attach_bet(
+                                candidate_id,
+                                bet_id=str(result["bet_id"]),
+                                stake=float(alloc["backer_stake"]),
+                                liability=float(alloc["liability"]),
+                            )
+                    except Exception as e:
+                        self._log(f"Could not link prediction candidate to bet (non-fatal): {e}")
                     placed.append({
                         "market_id":   market_id,
                         "runner_name": opp.get("runner_name"),
@@ -746,9 +912,14 @@ class OrchestratorAgent:
         """
         state = SessionState(venue=venue, bankroll=bankroll, remaining_bankroll=bankroll)
         state.add_log(f"Orchestrator started: venue={venue} bankroll=${bankroll:.2f} mode={mode}")
+        from opportunity_scoring import ScoreConfig
+        score_config = ScoreConfig(
+            min_profit_ratio=min_profit_ratio,
+            min_edge_pct=min_edge_pct,
+        )
 
         # ── Step 1: Analyst ───────────────────────────────────────────────
-        analyst = VenueAnalystAgent(self.bf, self.rc, state)
+        analyst = VenueAnalystAgent(self.bf, self.rc, state, score_config=score_config)
         analyst_result = analyst.run()
         if not analyst_result.get("success"):
             return {
@@ -759,11 +930,11 @@ class OrchestratorAgent:
             }
 
         # ── Step 2: Risk Manager ──────────────────────────────────────────
-        risk = RiskManagerAgent(self.bf, self.rc, state, loss_limit_pct=loss_limit_pct)
+        risk = RiskManagerAgent(self.bf, self.rc, state, loss_limit_pct=loss_limit_pct, score_config=score_config)
         risk_result = risk.run()
 
         # ── Step 3: Execution ─────────────────────────────────────────────
-        executor = ExecutionAgent(self.bf, self.rc, state)
+        executor = ExecutionAgent(self.bf, self.rc, state, score_config=score_config)
         exec_result = executor.run(task=mode)
 
         # ── Step 4: Reporter ──────────────────────────────────────────────

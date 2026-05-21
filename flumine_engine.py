@@ -3,6 +3,9 @@ Flumine Execution Engine
 Provides Flumine-based streaming strategies that run continuously,
 receiving real-time market updates rather than polling.
 
+Safety: Flumine places exchange orders directly through its own client, so
+FlumineRunner refuses to start while PAPER_MODE=true.
+
 Why Flumine vs polling (BetfairClient):
   - Polling: fetch data on demand → suitable for one-off decisions
   - Streaming: Betfair pushes every market tick instantly → needed for
@@ -18,8 +21,8 @@ Strategies implemented here:
 
 Usage:
     from flumine_engine import FlumineRunner
-    runner = FlumineRunner(credentials_path='credentials.json', bankroll=500)
-    runner.add_venue_strategy(venue='Doomben', model='kash', max_stake=20)
+    runner = FlumineRunner(bankroll=500)  # credentials come from BETFAIR_* env vars
+    runner.add_venue_strategy(venue='Doomben', max_liability=30)
     runner.start()   # blocks until all races are done
 """
 
@@ -33,7 +36,36 @@ import re
 import threading
 from typing import Optional
 
+from betfair_client import BetfairCredentialError, is_paper_mode
+
 logger = logging.getLogger(__name__)
+
+
+class FluminePaperModeError(RuntimeError):
+    """Raised when a live Flumine runner is requested while PAPER_MODE is enabled."""
+
+
+def _load_flumine_credentials() -> dict:
+    """Load Flumine/Betfair credentials from the same env vars as BetfairClient."""
+    username = os.environ.get("BETFAIR_USERNAME")
+    password = os.environ.get("BETFAIR_PASSWORD")
+    app_key = os.environ.get("BETFAIR_APP_KEY")
+
+    missing = [
+        name for name, value in (
+            ("BETFAIR_USERNAME", username),
+            ("BETFAIR_PASSWORD", password),
+            ("BETFAIR_APP_KEY", app_key),
+        )
+        if not value
+    ]
+    if missing:
+        raise BetfairCredentialError(
+            f"Flumine credentials missing — set {', '.join(missing)} in your .env file "
+            "(see .env.example)."
+        )
+
+    return {"username": username, "password": password, "app_key": app_key}
 
 # ─────────────────────────────────────────────────────────────────────────────
 # LAZY IMPORTS  (flumine / betfairlightweight are optional heavy deps)
@@ -270,6 +302,7 @@ def _make_venue_lay_strategy(
     bankroll: float,
     max_liability: float = 50.0,
     min_profit_ratio: float = 1.5,
+    min_edge_pct: float = 3.0,
     trigger_seconds: float = 120.0,
 ):
     """
@@ -287,10 +320,13 @@ def _make_venue_lay_strategy(
     from flumine.order.order import LimitOrder
     from flumine.order.trade import Trade
     from betfairlightweight.resources import MarketBook
-    from staking_engine import recommend_stake
+    from market_analyser import market_spread, weight_of_money
+    from opportunity_scoring import ScoreConfig, score_lay_opportunity
+    from staking_engine import estimate_edge_from_sp, recommend_stake
 
     venue_lower = venue.lower().strip()
     _placed: set[tuple[str, int]] = set()  # (market_id, selection_id) already traded
+    score_config = ScoreConfig(min_profit_ratio=min_profit_ratio, min_edge_pct=min_edge_pct)
 
     class _VenueLayStrategy(BaseStrategy):
         _label = f"VenueLay_{venue}"
@@ -323,25 +359,69 @@ def _make_venue_lay_strategy(
                     continue
 
                 best_lay = runner.ex.available_to_lay[0]["price"]
+                best_back = (
+                    runner.ex.available_to_back[0]["price"]
+                    if runner.ex.available_to_back else None
+                )
 
-                # Gate 1: profit ratio
                 if best_lay <= 1.0:
                     continue
-                profit_ratio = 1.0 / (best_lay - 1.0)
-                if profit_ratio < min_profit_ratio:
-                    continue
 
-                # Gate 2: model edge
+                # Gate 1: model edge
                 sel_id_str = str(runner.selection_id)
                 edge = ratings_cache.model_edge(
-                    market_id, sel_id_str, current_lay=best_lay, model="kash"
+                    market_id,
+                    sel_id_str,
+                    current_lay=best_lay,
+                    current_back=best_back,
+                    model="kash",
                 )
-                if edge.get("signal") not in ("LAY", "BOTH", "NO_MODEL_PRICE"):
-                    continue  # Model says BACK or NONE → skip
 
-                # Gate 3: Kelly stake sizing
-                model_price = edge.get("model_price") or best_lay
-                win_prob    = min(0.95, 1.0 / model_price)
+                wom_signal = "UNKNOWN"
+                try:
+                    wom = weight_of_money(
+                        runner.ex.available_to_back or [],
+                        runner.ex.available_to_lay or [],
+                    )
+                    wom_signal = wom.get("signal", "UNKNOWN")
+                except Exception:
+                    wom_signal = "UNKNOWN"
+
+                spread = market_spread(best_back, best_lay)
+
+                sp_edge = {}
+                if betfair_client is not None:
+                    try:
+                        from shared_cache import SharedCache
+                        sp_result = SharedCache.instance().bsp_predictions(
+                            market_id,
+                            lambda m=market_id: betfair_client.get_sp_predictions(m),
+                        )
+                        for sp_runner in sp_result.get("runners", []):
+                            if str(sp_runner.get("selection_id")) == sel_id_str:
+                                sp_edge = sp_runner.get("edge_analysis") or estimate_edge_from_sp(
+                                    best_lay,
+                                    sp_runner.get("sp_near"),
+                                    sp_runner.get("sp_far"),
+                                )
+                                break
+                    except Exception:
+                        sp_edge = {}
+
+                score = score_lay_opportunity(
+                    lay_price=best_lay,
+                    best_back=best_back,
+                    model_edge=edge,
+                    wom_signal=wom_signal,
+                    sp_edge=sp_edge,
+                    spread=spread,
+                    config=score_config,
+                )
+                if score["verdict"] not in ("STRONG_LAY", "LAY"):
+                    continue
+
+                # Gate 2: Kelly stake sizing
+                win_prob = score["estimated_win_prob"]
                 try:
                     stake_rec = recommend_stake(
                         bankroll=bankroll,
@@ -365,7 +445,7 @@ def _make_venue_lay_strategy(
                 logger.info(
                     f"[{self._label}] LAY sel={runner.selection_id} @ {best_lay} "
                     f"stake={backer_stake:.2f} liability={liability:.2f} "
-                    f"model_edge={edge.get('signal')}"
+                    f"score={score['score']} verdict={score['verdict']}"
                 )
                 trade = Trade(market_id=market_id, selection_id=runner.selection_id,
                               handicap=runner.handicap, strategy=self)
@@ -389,7 +469,7 @@ class FlumineRunner:
     Manages a Flumine framework instance for automated betting.
 
     Usage:
-        runner = FlumineRunner(credentials_path='credentials.json', bankroll=500)
+        runner = FlumineRunner(bankroll=500)
         runner.add_model_strategy(event_type='horse', model='kash')
         runner.add_venue_strategy(venue='Doomben', max_liability=30)
         runner.start()   # blocks — Ctrl+C or end-of-day to stop
@@ -397,19 +477,26 @@ class FlumineRunner:
 
     def __init__(
         self,
-        credentials_path: str = "credentials.json",
+        credentials_path: Optional[str] = None,
         bankroll: float = 200.0,
         log_path:  str = "orders_agent.csv",
         daily_loss_limit: float = 100.0,
     ):
+        if is_paper_mode():
+            raise FluminePaperModeError(
+                "PAPER_MODE=true prevents starting Flumine streaming because Flumine "
+                "places live exchange orders directly. Use polling mode for paper-mode "
+                "simulation, or set PAPER_MODE=false only when you intend to bet real money."
+            )
+
         if not _check_flumine():
             raise ImportError(
                 "flumine is not installed. Run: pip install flumine betfairlightweight"
             )
 
-        import json
-        with open(credentials_path) as f:
-            creds = json.load(f)
+        # credentials_path is accepted for backward compatibility but ignored.
+        # The whole Codex path now uses env-only credentials.
+        creds = _load_flumine_credentials()
 
         import betfairlightweight
         from flumine import Flumine, clients
@@ -477,6 +564,7 @@ class FlumineRunner:
         betfair_client=None,
         max_liability:   float = 50.0,
         min_profit_ratio: float = 1.5,
+        min_edge_pct:    float = 3.0,
         trigger_seconds: float = 120.0,
     ) -> "FlumineRunner":
         """
@@ -492,6 +580,7 @@ class FlumineRunner:
             bankroll=self._bankroll,
             max_liability=max_liability,
             min_profit_ratio=min_profit_ratio,
+            min_edge_pct=min_edge_pct,
             trigger_seconds=trigger_seconds,
         )
         strategy = strategy_cls(

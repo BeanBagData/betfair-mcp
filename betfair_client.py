@@ -17,6 +17,115 @@ from typing import Optional
 
 logger = logging.getLogger(__name__)
 
+
+class BetfairCredentialError(RuntimeError):
+    """Raised when required Betfair credentials are missing from the environment."""
+
+
+import uuid
+
+
+_PAPER_LOG_PATH = "bet_log.json"
+
+
+def _paper_log_path() -> str:
+    return os.environ.get("PAPER_BET_LOG_PATH", _PAPER_LOG_PATH)
+
+
+def is_paper_mode() -> bool:
+    """Return True iff PAPER_MODE env var is anything other than an explicit false-y value."""
+    raw = os.environ.get("PAPER_MODE", "true").strip().lower()
+    return raw not in ("false", "0", "no", "off", "")
+
+
+def _paper_bet_id() -> str:
+    return f"paper-{uuid.uuid4().hex[:12]}"
+
+
+def _append_paper_bet_log(entry: dict) -> bool:
+    """Append a paper-bet record to bet_log.json.
+
+    Returns True on success, False on any write failure. On read of a
+    corrupted ledger, the bad file is renamed to bet_log.json.corrupt-<ts>
+    and a fresh ledger is started.
+    """
+    log_path = _paper_log_path()
+    entries: list = []
+    if os.path.exists(log_path):
+        try:
+            with open(log_path, "r") as f:
+                loaded = json.load(f)
+            if isinstance(loaded, list):
+                entries = loaded
+            else:
+                # Wrong shape — treat as corrupted.
+                raise ValueError(f"{log_path} is not a JSON array")
+        except (json.JSONDecodeError, ValueError, OSError) as e:
+            backup = f"{log_path}.corrupt-{int(datetime.now(timezone.utc).timestamp())}"
+            try:
+                os.rename(log_path, backup)
+                logger.error(
+                    "Paper bet log %s was corrupted (%s); moved to %s. Starting fresh ledger.",
+                    log_path, e, backup,
+                )
+            except OSError as rename_err:
+                logger.error(
+                    "Paper bet log %s was corrupted (%s) and could not be backed up (%s). "
+                    "Refusing to overwrite.",
+                    log_path, e, rename_err,
+                )
+                return False
+            entries = []
+    entries.append(entry)
+    try:
+        parent = os.path.dirname(os.path.abspath(log_path))
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        with open(log_path, "w") as f:
+            json.dump(entries, f, indent=2, default=str)
+        return True
+    except OSError as e:
+        logger.error("Could not write paper bet log: %s", e)
+        return False
+
+
+def _remove_paper_bet_log(bet_id: str) -> bool:
+    """Remove a paper-bet record by bet_id. Returns True if found and removed.
+
+    Logs at error level (does not silently swallow) when the ledger is missing,
+    unreadable, corrupted, or unwritable — so callers and operators can tell
+    "bet wasn't in the ledger" apart from "ledger is broken".
+    """
+    log_path = _paper_log_path()
+    if not os.path.exists(log_path):
+        logger.error("Paper bet log %s does not exist; cannot cancel %s.",
+                     log_path, bet_id)
+        return False
+    try:
+        with open(log_path, "r") as f:
+            entries = json.load(f)
+    except (json.JSONDecodeError, OSError) as e:
+        logger.error("Paper bet log %s could not be read (%s); cannot cancel %s.",
+                     log_path, e, bet_id)
+        return False
+    if not isinstance(entries, list):
+        logger.error("Paper bet log %s is not a JSON array; cannot cancel %s.",
+                     log_path, bet_id)
+        return False
+    new_entries = [e for e in entries if e.get("bet_id") != bet_id]
+    if len(new_entries) == len(entries):
+        # Genuinely "not found" — not an error, just a caller-side miss.
+        return False
+    try:
+        with open(log_path, "w") as f:
+            json.dump(new_entries, f, indent=2, default=str)
+        return True
+    except OSError as e:
+        logger.error("Paper bet log %s could not be rewritten after removing %s: %s",
+                     log_path, bet_id, e)
+        return False
+
+
 # Primary endpoints (global — work for AU/NZ)
 BETTING_ENDPOINT  = "https://api.betfair.com/exchange/betting/rest/v1.0"
 ACCOUNT_ENDPOINT  = "https://api.betfair.com/exchange/account/rest/v1.0"
@@ -30,30 +139,39 @@ INTERACTIVE_LOGIN_ENDPOINT = "https://identitysso.betfair.com.au/api/login"
 
 
 class BetfairClient:
-    def __init__(self, credentials_path: str = "credentials.json"):
+    def __init__(self, credentials_path: Optional[str] = None):
+        # credentials_path is accepted for backwards compatibility but ignored.
+        # Credentials are read exclusively from environment variables.
         self.session_token: Optional[str] = None
         self.app_key: Optional[str] = None
         self.username: Optional[str] = None
         self.password: Optional[str] = None
-        self.credentials_path = credentials_path
         self._load_credentials()
 
     def _load_credentials(self):
-        """Load credentials from JSON file."""
-        try:
-            with open(self.credentials_path, "r") as f:
-                creds = json.load(f)
-            self.username = creds["username"]
-            self.password = creds["password"]
-            self.app_key = creds["app_key"]
-            logger.info(f"Credentials loaded for user: {self.username}")
-        except FileNotFoundError:
-            raise FileNotFoundError(
-                f"credentials.json not found at '{self.credentials_path}'. "
-                "Please create it with: {\"username\": \"...\", \"password\": \"...\", \"app_key\": \"...\"}"
+        """Load credentials from environment variables. Raises BetfairCredentialError if any are missing."""
+        username = os.environ.get("BETFAIR_USERNAME")
+        password = os.environ.get("BETFAIR_PASSWORD")
+        app_key  = os.environ.get("BETFAIR_APP_KEY")
+
+        missing = [
+            name for name, value in (
+                ("BETFAIR_USERNAME", username),
+                ("BETFAIR_PASSWORD", password),
+                ("BETFAIR_APP_KEY",  app_key),
             )
-        except KeyError as e:
-            raise ValueError(f"Missing key in credentials.json: {e}")
+            if not value
+        ]
+        if missing:
+            raise BetfairCredentialError(
+                f"Betfair credentials missing — set {', '.join(missing)} in your .env file "
+                "(see .env.example)."
+            )
+
+        self.username = username
+        self.password = password
+        self.app_key  = app_key
+        logger.info("Betfair credentials loaded from environment for user: %s", self.username)
 
     def login(self) -> dict:
         """Login to Betfair using interactive login (no certificates)."""
@@ -642,6 +760,7 @@ class BetfairClient:
         lay_price: float,
         stake: float,
         strategy_ref: str = "lay_agent",
+        context: Optional[dict] = None,
     ) -> dict:
         """
         Place a lay bet on a selection.
@@ -652,12 +771,59 @@ class BetfairClient:
             lay_price: The price to lay at
             stake: The backer's stake (amount you'll win if the horse loses)
             strategy_ref: Strategy reference for tracking (max 15 chars)
+            context: Optional strategy context for paper-bet audit logging
 
         Returns:
             Bet placement result with bet ID and status
         """
         # Validate price is a valid Betfair tick
         lay_price = self._round_to_nearest_tick(lay_price)
+
+        if is_paper_mode():
+            liability = round((lay_price - 1) * stake, 2)
+            bet_id = _paper_bet_id()
+            entry = {
+                "bet_id":       bet_id,
+                "paper":        True,
+                "side":         "LAY",
+                "market_id":    market_id,
+                "selection_id": selection_id,
+                "lay_price":    lay_price,
+                "stake":        round(stake, 2),
+                "liability":    liability,
+                "strategy_ref": strategy_ref[:15],
+                "context":      context or {},
+                "placed_at":    datetime.now(timezone.utc).isoformat(),
+            }
+            if not _append_paper_bet_log(entry):
+                return {
+                    "success":      False,
+                    "paper":        True,
+                    "error":        "PAPER_LEDGER_WRITE_FAILED",
+                    "market_id":    market_id,
+                    "selection_id": selection_id,
+                    "lay_price":    lay_price,
+                    "stake":        round(stake, 2),
+                    "message":      "Paper bet was NOT recorded — ledger write failed. See logs.",
+                }
+            logger.info("PAPER lay bet: market=%s sel=%s @ %s stake=%s id=%s",
+                        market_id, selection_id, lay_price, stake, bet_id)
+            return {
+                "success":               True,
+                "paper":                 True,
+                "bet_id":                bet_id,
+                "status":                "PAPER_PLACED",
+                "placed_date":           entry["placed_at"],
+                "size_matched":          0,
+                "average_price_matched": 0,
+                "market_id":             market_id,
+                "selection_id":          selection_id,
+                "lay_price":             lay_price,
+                "stake":                 round(stake, 2),
+                "liability":             liability,
+                "potential_profit":      round(stake, 2),
+                "message":               f"PAPER lay bet (id={bet_id}). No real money. Risk £{liability:.2f} to win £{stake:.2f}",
+            }
 
         params = {
             "marketId": market_id,
@@ -711,6 +877,28 @@ class BetfairClient:
 
     def cancel_order(self, market_id: str, bet_id: Optional[str] = None) -> dict:
         """Cancel an order. If bet_id is None, cancels all orders for the market."""
+        if is_paper_mode():
+            if bet_id is None:
+                return {
+                    "success": False,
+                    "error":   "PAPER_MODE_CANCEL_ALL_NOT_SUPPORTED",
+                    "message": "Cancelling all orders is not supported in paper mode. Pass a specific paper bet_id.",
+                }
+            if not str(bet_id).startswith("paper-"):
+                return {
+                    "success": False,
+                    "error":   "PAPER_MODE_REAL_BET_ID",
+                    "message": f"Refusing to cancel real bet id {bet_id!r} while PAPER_MODE=true. "
+                               "Set PAPER_MODE=false to cancel real bets.",
+                }
+            removed = _remove_paper_bet_log(bet_id)
+            if removed:
+                return {"success": True, "paper": True, "bet_id": bet_id,
+                        "message": f"Paper bet {bet_id} cancelled."}
+            return {"success": False, "paper": True, "bet_id": bet_id,
+                    "error": "PAPER_BET_NOT_FOUND",
+                    "message": f"No paper bet with id {bet_id} found in {_paper_log_path()}."}
+
         params = {"marketId": market_id}
         if bet_id:
             params["instructions"] = [{"betId": bet_id}]
@@ -962,6 +1150,49 @@ class BetfairClient:
         by the market). Complements place_lay_bet for full model-driven execution.
         """
         back_price = self._round_to_nearest_tick(back_price)
+        if is_paper_mode():
+            potential_profit = round((back_price - 1) * stake, 2)
+            bet_id = _paper_bet_id()
+            entry = {
+                "bet_id":       bet_id,
+                "paper":        True,
+                "side":         "BACK",
+                "market_id":    market_id,
+                "selection_id": selection_id,
+                "back_price":   back_price,
+                "stake":        round(stake, 2),
+                "potential_profit": potential_profit,
+                "placed_at":    datetime.now(timezone.utc).isoformat(),
+            }
+            if not _append_paper_bet_log(entry):
+                return {
+                    "success":      False,
+                    "paper":        True,
+                    "error":        "PAPER_LEDGER_WRITE_FAILED",
+                    "market_id":    market_id,
+                    "selection_id": selection_id,
+                    "back_price":   back_price,
+                    "stake":        round(stake, 2),
+                    "message":      "Paper bet was NOT recorded — ledger write failed. See logs.",
+                }
+            logger.info("PAPER back bet: market=%s sel=%s @ %s stake=%s id=%s",
+                        market_id, selection_id, back_price, stake, bet_id)
+            return {
+                "success":          True,
+                "paper":            True,
+                "bet_id":           bet_id,
+                "status":           "PAPER_PLACED",
+                "placed_date":      entry["placed_at"],
+                "size_matched":     0,
+                "average_price_matched": 0,
+                "market_id":        market_id,
+                "selection_id":     selection_id,
+                "back_price":       back_price,
+                "stake":            round(stake, 2),
+                "potential_profit": potential_profit,
+                "message":          f"PAPER back bet (id={bet_id}). No real money. Risk £{stake:.2f} to win £{potential_profit:.2f}",
+            }
+
         params = {
             "marketId": market_id,
             "instructions": [{

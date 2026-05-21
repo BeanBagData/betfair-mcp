@@ -67,6 +67,18 @@ def _bucket_label(value: float, buckets: list[tuple]) -> str:
     return "other"
 
 
+def _history_path() -> str:
+    return os.environ.get("BETTING_HISTORY_PATH", HISTORY_PATH)
+
+
+def _bet_log_path() -> str:
+    return os.environ.get("PAPER_BET_LOG_PATH") or os.environ.get("BET_LOG_PATH", BET_LOG_PATH)
+
+
+def _orders_csv_path() -> str:
+    return os.environ.get("ORDERS_CSV_PATH", ORDERS_CSV)
+
+
 def _safe_load_json(path: str, default) -> Any:
     if os.path.exists(path):
         try:
@@ -176,8 +188,8 @@ class BettingMemory:
 
     MAX_RECORDS = 1000   # rolling cap to keep file size manageable
 
-    def __init__(self, path: str = HISTORY_PATH):
-        self.path = path
+    def __init__(self, path: Optional[str] = None):
+        self.path = path or _history_path()
         self._records: dict[str, BetRecord] = {}  # bet_id → BetRecord
         self._load()
 
@@ -281,7 +293,7 @@ class BettingMemory:
 
     def _sync_from_bet_log(self) -> int:
         """Read bet_log.json and settle any matching open records."""
-        logs = _safe_load_json(BET_LOG_PATH, [])
+        logs = _safe_load_json(_bet_log_path(), [])
         settled = 0
         for entry in logs:
             bet_id = str(entry.get("bet_id", ""))
@@ -307,9 +319,10 @@ class BettingMemory:
         settled = 0
         try:
             import csv
-            if not os.path.exists(ORDERS_CSV):
+            orders_csv = _orders_csv_path()
+            if not os.path.exists(orders_csv):
                 return 0
-            with open(ORDERS_CSV, newline="") as f:
+            with open(orders_csv, newline="") as f:
                 reader = csv.DictReader(f)
                 for row in reader:
                     bet_id = str(row.get("bet_id", row.get("id", "")))

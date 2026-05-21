@@ -1,0 +1,5 @@
+# Development dependencies — install with:
+#   pip install -r requirements-dev.txt
+# Production dependencies live in requirements.txt.
+
+pytest>=7.4

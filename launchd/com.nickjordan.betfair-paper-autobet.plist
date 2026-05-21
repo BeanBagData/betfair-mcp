@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.nickjordan.betfair-paper-autobet</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>/Users/nickjordan/Library/Application Support/BetfairMCP/bin/paper-autobet-once.sh</string>
+    <string>--run-due</string>
+  </array>
+
+  <key>RunAtLoad</key>
+  <true/>
+
+  <key>StartInterval</key>
+  <integer>1800</integer>
+
+  <key>StandardOutPath</key>
+  <string>/Users/nickjordan/Library/Application Support/BetfairMCP/logs/paper-autobet.out.log</string>
+
+  <key>StandardErrorPath</key>
+  <string>/Users/nickjordan/Library/Application Support/BetfairMCP/logs/paper-autobet.err.log</string>
+</dict>
+</plist>

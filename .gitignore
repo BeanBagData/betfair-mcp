@@ -1,0 +1,31 @@
+# Secrets
+.env
+.env.local
+credentials.json
+
+# Generated state
+bet_log.json
+betting_history.json
+candidate_ledger.json
+orders_agent.csv
+agent_memory.json
+paper_autobet_state.json
+candidate_ledger.json
+logs/
+*.log
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Editor
+.vscode/
+.idea/
+*.swp
+.DS_Store
